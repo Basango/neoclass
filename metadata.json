@@ -1,0 +1,8 @@
+{
+  "name": "Neoclass",
+  "description": "An AI-powered, gamified study companion for Indian students, featuring 1-3-7 revision tracking and Attio-style minimalist design.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
