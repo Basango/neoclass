@@ -38,13 +38,20 @@ export const storageService = {
           cues: d.cues || [],
           quiz: d.quiz || [],
           examDate: d.exam_date,
-          nextReview: d.next_review
+          studySchedule: d.study_schedule || (d.next_review ? [d.next_review] : []) // Migration fallback
         }));
     }
 
     // --- LOCAL STORAGE MODE ---
     const stored = localStorage.getItem('neoclass_notes');
-    return stored ? JSON.parse(stored) : [];
+    if (!stored) return [];
+    
+    const parsed = JSON.parse(stored);
+    // Migration for local data
+    return parsed.map((n: any) => ({
+        ...n,
+        studySchedule: n.studySchedule || (n.nextReview ? [n.nextReview] : [])
+    }));
   },
 
   upsertNote: async (note: Note) => {
@@ -66,7 +73,7 @@ export const storageService = {
           cues: note.cues,
           quiz: note.quiz,
           exam_date: note.examDate,
-          next_review: note.nextReview
+          study_schedule: note.studySchedule // New column mapping
         };
 
         const { error } = await supabase.from('notes').upsert(dbNote);

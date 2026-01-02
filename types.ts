@@ -10,7 +10,7 @@ export interface Note {
   status: 'new' | 'review_1' | 'review_3' | 'review_7' | 'mastered';
   tags: string[];
   examDate?: string; // ISO String
-  nextReview?: string; // ISO String
+  studySchedule: string[]; // Array of ISO Strings for planned reviews
 }
 
 export interface UserStats {
