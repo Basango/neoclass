@@ -12,17 +12,93 @@ import {
   Moon,
   X,
   ArrowRight,
-  MoreHorizontal
+  MoreHorizontal,
+  Calendar as CalendarIcon,
+  CheckCircle2,
+  BrainCircuit,
+  HelpCircle,
+  ChevronRight,
+  LogOut,
+  Loader2
 } from 'lucide-react';
 import { analyzeImage } from './services/geminiService';
 import { storageService } from './services/storageService';
-import { Note, UserStats, ProcessingState } from './types';
+import { authService } from './services/authService';
+import { supabase } from './services/supabase';
+import { Note, UserStats, ProcessingState, UserProfile } from './types';
 import { GalaxyLoader } from './components/Loaders';
 import { MandalaProgress } from './components/MandalaProgress';
+import { LandingPage } from './components/LandingPage';
+
+// --- Helper Functions ---
+const getNextReviewDate = (currentStatus: Note['status']): string => {
+  const today = new Date();
+  let daysToAdd = 0;
+  
+  switch(currentStatus) {
+    case 'new': daysToAdd = 1; break; // 1 day later
+    case 'review_1': daysToAdd = 3; break; // 3 days later
+    case 'review_3': daysToAdd = 7; break; // 7 days later
+    case 'review_7': daysToAdd = 14; break; // 14 days later (mastery maintenance)
+    default: daysToAdd = 30;
+  }
+  
+  today.setDate(today.getDate() + daysToAdd);
+  return today.toISOString();
+};
+
+const getNextStatus = (currentStatus: Note['status']): Note['status'] => {
+  if (currentStatus === 'new') return 'review_1';
+  if (currentStatus === 'review_1') return 'review_3';
+  if (currentStatus === 'review_3') return 'review_7';
+  return 'mastered';
+};
+
+const compressImage = (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (event) => {
+      const img = new Image();
+      img.src = event.target?.result as string;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+        const MAX_WIDTH = 1024;
+        const MAX_HEIGHT = 1024;
+
+        if (width > height) {
+          if (width > MAX_WIDTH) {
+            height *= MAX_WIDTH / width;
+            width = MAX_WIDTH;
+          }
+        } else {
+          if (height > MAX_HEIGHT) {
+            width *= MAX_HEIGHT / height;
+            height = MAX_HEIGHT;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx?.drawImage(img, 0, 0, width, height);
+        
+        // Get raw base64 data (remove prefix)
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.6); // 60% quality is enough for OCR
+        const base64 = dataUrl.split(',')[1];
+        resolve(base64);
+      };
+      img.onerror = (error) => reject(error);
+    };
+    reader.onerror = (error) => reject(error);
+  });
+};
 
 // --- UI Components ---
 
-const Sidebar = ({ activeTab, setActiveTab }: { activeTab: string, setActiveTab: (t: string) => void }) => {
+const Sidebar = ({ activeTab, setActiveTab, onLogout }: { activeTab: string, setActiveTab: (t: string) => void, onLogout: () => void }) => {
   const menuItems = [
     { id: 'dashboard', icon: Layout, label: 'Dashboard' },
     { id: 'notes', icon: BookOpen, label: 'Notes' },
@@ -62,23 +138,22 @@ const Sidebar = ({ activeTab, setActiveTab }: { activeTab: string, setActiveTab:
         ))}
       </nav>
 
-      <div className="p-4 md:p-6">
-        <div className="glass-panel p-4 rounded-xl relative overflow-hidden group cursor-pointer hover:border-indigo-500/30 transition-colors hidden md:block">
-          <div className="absolute inset-0 bg-gradient-to-r from-indigo-500/5 to-purple-500/5 opacity-0 group-hover:opacity-100 transition-opacity"></div>
-          <div className="flex justify-between items-center mb-1">
-             <p className="text-[10px] text-zinc-500 font-semibold uppercase tracking-wider">Exam Countdown</p>
-             <Clock size={12} className="text-indigo-500" />
-          </div>
-          <p className="text-2xl font-light text-zinc-900 dark:text-white">42 <span className="text-xs font-normal text-zinc-500">days</span></p>
-        </div>
+      {/* Logout Button in Sidebar */}
+      <div className="p-4 mt-auto">
+        <button 
+          onClick={onLogout}
+          className="w-full flex items-center gap-3 p-3 text-zinc-400 hover:text-red-500 transition-colors"
+        >
+          <LogOut size={20} strokeWidth={1.5} />
+          <span className="hidden md:block text-sm">Sign Out</span>
+        </button>
       </div>
     </aside>
   );
 };
 
-const NoteCard = ({ note }: { note: Note }) => (
-  <div className="glass-panel p-5 rounded-xl hover-card group cursor-pointer h-full flex flex-col relative overflow-hidden">
-    {/* Subtle gradient blob on hover */}
+const NoteCard = ({ note, onClick }: { note: Note, onClick: () => void }) => (
+  <div onClick={onClick} className="glass-panel p-5 rounded-xl hover-card group cursor-pointer h-full flex flex-col relative overflow-hidden">
     <div className="absolute -right-10 -top-10 w-32 h-32 bg-indigo-500/5 dark:bg-indigo-500/10 rounded-full blur-3xl group-hover:bg-indigo-500/10 dark:group-hover:bg-indigo-500/20 transition-all duration-500"></div>
     
     <div className="flex justify-between items-start mb-3 relative z-10">
@@ -96,13 +171,202 @@ const NoteCard = ({ note }: { note: Note }) => (
       {note.summary}
     </p>
     
-    <div className="flex gap-2 flex-wrap mt-auto pt-3 border-t border-zinc-100 dark:border-white/5">
-      {note.tags.slice(0, 2).map(tag => (
-        <span key={tag} className="text-[10px] text-zinc-400 group-hover:text-zinc-600 dark:group-hover:text-zinc-300 transition-colors">#{tag}</span>
-      ))}
+    <div className="flex justify-between items-center mt-auto pt-3 border-t border-zinc-100 dark:border-white/5">
+      <div className="flex gap-2 flex-wrap">
+        {note.tags.slice(0, 2).map(tag => (
+          <span key={tag} className="text-[10px] text-zinc-400 group-hover:text-zinc-600 dark:group-hover:text-zinc-300 transition-colors">#{tag}</span>
+        ))}
+      </div>
+      {note.nextReview && (
+        <span className="text-[10px] text-zinc-400 flex items-center gap-1">
+           <Clock size={10} /> {new Date(note.nextReview).toLocaleDateString(undefined, {month:'short', day:'numeric'})}
+        </span>
+      )}
     </div>
   </div>
 );
+
+const QuizCard = ({ question, index }: { question: { question: string, answer: string }, index: number }) => {
+  const [isRevealed, setIsRevealed] = useState(false);
+
+  return (
+    <div className="glass-panel p-6 rounded-xl border border-zinc-200 dark:border-white/10 transition-all duration-300 hover:border-indigo-500/30">
+       <div className="flex gap-4">
+          <span className="flex-shrink-0 w-8 h-8 rounded-full bg-zinc-100 dark:bg-white/5 text-zinc-500 flex items-center justify-center text-sm font-medium border border-zinc-200 dark:border-white/5">{index + 1}</span>
+          <div className="space-y-3 flex-1">
+             <h3 className="text-base md:text-lg text-zinc-800 dark:text-zinc-100 font-medium leading-snug">{question.question}</h3>
+             
+             <div 
+               onClick={() => setIsRevealed(!isRevealed)}
+               className={`relative overflow-hidden rounded-lg border transition-all duration-300 cursor-pointer ${
+                 isRevealed 
+                   ? 'bg-emerald-50/50 dark:bg-emerald-900/10 border-emerald-100 dark:border-emerald-500/20' 
+                   : 'bg-zinc-50 dark:bg-white/5 border-zinc-100 dark:border-white/5 hover:bg-zinc-100 dark:hover:bg-white/10'
+               }`}
+             >
+                <div className="p-4">
+                   <div className="flex items-center justify-between mb-2">
+                       <span className={`text-[10px] font-bold uppercase tracking-widest ${isRevealed ? 'text-emerald-600 dark:text-emerald-400' : 'text-zinc-400'}`}>
+                         Answer
+                       </span>
+                       {isRevealed ? (
+                           <span className="text-[10px] text-zinc-400 uppercase tracking-wider">Tap to hide</span>
+                       ) : null}
+                   </div>
+                   
+                   <div className="relative">
+                       {/* Blur answer logic: We render the text but blur it if not revealed. 'user-select-none' prevents cheating by highlighting. */}
+                       <p className={`text-sm leading-relaxed transition-all duration-500 text-zinc-700 dark:text-zinc-300 ${isRevealed ? 'blur-0' : 'blur-md select-none opacity-50'}`}>
+                          {question.answer}
+                       </p>
+                       
+                       {!isRevealed && (
+                           <div className="absolute inset-0 flex items-center justify-center z-10">
+                               <span className="text-xs text-zinc-500 dark:text-zinc-400 font-medium flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/50 dark:bg-black/50 backdrop-blur-sm border border-zinc-200/50 dark:border-white/10 shadow-sm">
+                                  <HelpCircle size={14} /> Tap to reveal
+                               </span>
+                           </div>
+                       )}
+                   </div>
+                </div>
+             </div>
+          </div>
+       </div>
+    </div>
+  );
+};
+
+const NoteDetailModal = ({ 
+    note, 
+    isOpen, 
+    onClose, 
+    onMarkRevised, 
+    isUpdating 
+}: { 
+    note: Note | null, 
+    isOpen: boolean, 
+    onClose: () => void, 
+    onMarkRevised: (n: Note) => void,
+    isUpdating?: boolean
+}) => {
+  const [tab, setTab] = useState<'cornell' | 'quiz'>('cornell');
+  
+  if (!isOpen || !note) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-0 md:p-6">
+      <div className="absolute inset-0 bg-white/60 dark:bg-black/80 backdrop-blur-md transition-opacity duration-300" onClick={onClose} />
+      
+      <div className="w-full h-full md:max-w-5xl md:h-[90vh] glass-panel md:rounded-2xl relative flex flex-col overflow-hidden shadow-2xl animate-in zoom-in-95 duration-300 border-none md:border md:border-zinc-200 md:dark:border-white/10 bg-zinc-50/90 dark:bg-[#0a0a0a]/90">
+        
+        {/* Modal Header */}
+        <div className="h-16 flex items-center justify-between px-6 border-b border-zinc-200/50 dark:border-white/5 bg-white/50 dark:bg-white/5 backdrop-blur-sm">
+           <div className="flex items-center gap-4">
+              <button onClick={onClose} className="p-2 -ml-2 rounded-full hover:bg-zinc-100 dark:hover:bg-white/10 text-zinc-400">
+                <ArrowRight size={20} className="rotate-180" strokeWidth={1.5} />
+              </button>
+              <div>
+                <h2 className="text-lg font-medium text-zinc-900 dark:text-white line-clamp-1">{note.title}</h2>
+                <div className="flex items-center gap-2 text-xs text-zinc-500">
+                   <span>{note.subject}</span>
+                   <span className="w-1 h-1 bg-zinc-300 rounded-full"></span>
+                   <span className="uppercase">{note.status.replace('_', ' ')}</span>
+                </div>
+              </div>
+           </div>
+
+           <div className="flex gap-2">
+             <button 
+               onClick={() => setTab('cornell')}
+               className={`px-4 py-2 text-xs font-medium rounded-lg transition-colors ${tab === 'cornell' ? 'bg-zinc-900 dark:bg-white text-white dark:text-black' : 'text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/5'}`}
+             >
+               Cornell Notes
+             </button>
+             <button 
+               onClick={() => setTab('quiz')}
+               className={`px-4 py-2 text-xs font-medium rounded-lg transition-colors ${tab === 'quiz' ? 'bg-zinc-900 dark:bg-white text-white dark:text-black' : 'text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/5'}`}
+             >
+               Quiz ({note.quiz?.length || 0})
+             </button>
+           </div>
+        </div>
+
+        {/* Modal Body */}
+        <div className="flex-1 overflow-y-auto p-6 md:p-10 bg-white/40 dark:bg-[#050505]/40">
+           {tab === 'cornell' && (
+             <div className="max-w-4xl mx-auto min-h-full flex flex-col shadow-sm border border-zinc-200 dark:border-white/5 bg-white dark:bg-[#121212] rounded-lg overflow-hidden">
+                {/* Header of Paper */}
+                <div className="p-6 border-b border-zinc-100 dark:border-white/5 bg-zinc-50/50 dark:bg-white/[0.02]">
+                   <h1 className="text-2xl font-serif text-zinc-900 dark:text-white mb-2">{note.title}</h1>
+                   <div className="flex gap-2">
+                      {note.tags.map(t => <span key={t} className="text-[10px] px-2 py-0.5 bg-zinc-100 dark:bg-white/10 rounded text-zinc-500">#{t}</span>)}
+                   </div>
+                </div>
+
+                <div className="flex-1 flex flex-col md:flex-row">
+                   {/* Left Column: Cues */}
+                   <div className="w-full md:w-[30%] border-b md:border-b-0 md:border-r border-zinc-100 dark:border-white/5 p-6 bg-zinc-50/30 dark:bg-white/[0.01]">
+                      <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-widest mb-4 flex items-center gap-2">
+                        <BrainCircuit size={14} /> Cues
+                      </h3>
+                      <ul className="space-y-4">
+                        {(note.cues || []).map((cue, i) => (
+                           <li key={i} className="text-sm font-medium text-indigo-600 dark:text-indigo-400 leading-snug">{cue}</li>
+                        ))}
+                        {(note.cues?.length === 0) && <p className="text-xs text-zinc-400 italic">No cues generated.</p>}
+                      </ul>
+                   </div>
+
+                   {/* Right Column: Notes */}
+                   <div className="w-full md:w-[70%] p-6 md:p-8">
+                      <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-widest mb-4">Notes</h3>
+                      <div className="prose dark:prose-invert prose-sm max-w-none text-zinc-700 dark:text-zinc-300 font-light leading-relaxed whitespace-pre-wrap">
+                         {note.originalText}
+                      </div>
+                   </div>
+                </div>
+
+                {/* Bottom: Summary */}
+                <div className="border-t border-zinc-100 dark:border-white/5 p-6 bg-indigo-50/30 dark:bg-indigo-950/10">
+                   <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-widest mb-2">Summary</h3>
+                   <p className="text-sm text-zinc-600 dark:text-zinc-300 italic">"{note.summary}"</p>
+                </div>
+             </div>
+           )}
+
+           {tab === 'quiz' && (
+             <div className="max-w-2xl mx-auto space-y-6">
+                {(note.quiz || []).map((q, i) => (
+                   <QuizCard key={i} question={q} index={i} />
+                ))}
+                {(note.quiz?.length === 0) && (
+                   <div className="text-center py-20 text-zinc-400">
+                      <HelpCircle size={48} className="mx-auto mb-4 opacity-20" />
+                      <p>No quiz questions available for this note.</p>
+                   </div>
+                )}
+             </div>
+           )}
+        </div>
+
+        {/* Modal Footer */}
+        <div className="p-6 border-t border-zinc-200/50 dark:border-white/5 bg-white/50 dark:bg-[#0a0a0a]/80 backdrop-blur-md flex justify-between items-center">
+           <div className="text-xs text-zinc-400">
+              Last reviewed: {note.nextReview ? new Date(new Date(note.nextReview).getTime() - 86400000).toLocaleDateString() : 'Never'}
+           </div>
+           <button 
+             onClick={() => onMarkRevised(note)}
+             disabled={isUpdating}
+             className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2.5 rounded-full text-sm font-medium transition-all shadow-lg shadow-indigo-500/30 hover:shadow-indigo-500/40 hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50 disabled:cursor-not-allowed"
+           >
+             {isUpdating ? <Loader2 size={16} className="animate-spin" /> : <CheckCircle2 size={16} />}
+             Mark Revised
+           </button>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 const UploadModal = ({ isOpen, onClose, onNoteProcessed }: { isOpen: boolean, onClose: () => void, onNoteProcessed: (note: Note) => void }) => {
   const [processingState, setProcessingState] = useState<ProcessingState>({ isProcessing: false, stage: 'idle' });
@@ -112,41 +376,38 @@ const UploadModal = ({ isOpen, onClose, onNoteProcessed }: { isOpen: boolean, on
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onloadend = async () => {
-      const base64String = reader.result as string;
-      const base64Data = base64String.split(',')[1];
+    try {
+      setProcessingState({ isProcessing: true, stage: 'analyzing' });
+      
+      const base64Data = await compressImage(file);
+      const result = await analyzeImage(base64Data);
+      
+      const newNote: Note = {
+        id: crypto.randomUUID(), // Use UUID instead of Date.now() for robustness
+        title: result.title || 'Untitled Note',
+        subject: result.subject || 'General',
+        summary: result.summary || 'No summary available.',
+        originalText: result.originalText || '',
+        cues: result.cues || [],
+        quiz: result.quiz || [],
+        dateCreated: new Date().toISOString(),
+        status: 'new',
+        tags: result.tags || [],
+        nextReview: getNextReviewDate('new')
+      };
 
-      try {
-        setProcessingState({ isProcessing: true, stage: 'analyzing' });
-        await new Promise(r => setTimeout(r, 2000)); 
-        
-        const result = await analyzeImage(base64Data);
-        
-        const newNote: Note = {
-          id: Date.now().toString(),
-          title: result.title || 'Untitled Note',
-          subject: result.subject || 'General',
-          summary: result.summary || 'No summary available.',
-          originalText: result.originalText || '',
-          dateCreated: new Date().toISOString(),
-          status: 'new',
-          tags: result.tags || []
-        };
-
-        setProcessingState({ isProcessing: true, stage: 'gamifying' });
-        await new Promise(r => setTimeout(r, 1000));
-        
-        onNoteProcessed(newNote);
-        onClose();
-      } catch (err) {
-        console.error(err);
-        alert('Failed to process image. Please try again.');
-      } finally {
-        setProcessingState({ isProcessing: false, stage: 'idle' });
-      }
-    };
-    reader.readAsDataURL(file);
+      setProcessingState({ isProcessing: true, stage: 'gamifying' });
+      // Minimal delay just to show the status transition
+      await new Promise(r => setTimeout(r, 500));
+      
+      onNoteProcessed(newNote);
+      onClose();
+    } catch (err) {
+      console.error(err);
+      alert('Failed to process image. Please try again.');
+    } finally {
+      setProcessingState({ isProcessing: false, stage: 'idle' });
+    }
   };
 
   if (!isOpen) return null;
@@ -167,7 +428,7 @@ const UploadModal = ({ isOpen, onClose, onNoteProcessed }: { isOpen: boolean, on
           <div className="flex-1 flex flex-col p-8">
             <div className="mb-6">
                <h2 className="text-2xl font-medium text-zinc-900 dark:text-white mb-2">Scan Notes</h2>
-               <p className="text-zinc-500 font-light text-sm">Upload a photo to instantly digitize and summarize.</p>
+               <p className="text-zinc-500 font-light text-sm">Upload a photo to instantly digitize, create Cornell notes, and quizzes.</p>
             </div>
 
             <div 
@@ -183,14 +444,6 @@ const UploadModal = ({ isOpen, onClose, onNoteProcessed }: { isOpen: boolean, on
               </div>
               <input type="file" ref={fileInputRef} className="hidden" accept="image/*" onChange={handleFileUpload} />
             </div>
-            
-            <div className="mt-6 flex items-center justify-between text-zinc-400 text-xs font-light px-1">
-               <div className="flex items-center gap-2">
-                 <Languages size={14} strokeWidth={1.5} />
-                 <span>English & Hindi Supported</span>
-               </div>
-               <span>AI-Powered</span>
-            </div>
           </div>
         )}
       </div>
@@ -198,47 +451,73 @@ const UploadModal = ({ isOpen, onClose, onNoteProcessed }: { isOpen: boolean, on
   );
 };
 
-const RevisionBoard = ({ notes }: { notes: Note[] }) => {
-  const columns = [
-    { id: 'new', label: 'In Queue', days: 0 },
-    { id: 'review_1', label: 'Tomorrow', days: 1 },
-    { id: 'review_3', label: '3 Days', days: 3 },
-    { id: 'review_7', label: 'Next Week', days: 7 },
-  ];
+const RevisionBoard = ({ notes, onUpdateExamDate }: { notes: Note[], onUpdateExamDate: (id: string, date: string) => void }) => {
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  
+  const upcomingReviews = notes
+    .filter(n => n.nextReview)
+    .sort((a, b) => new Date(a.nextReview!).getTime() - new Date(b.nextReview!).getTime());
+
+  const handleDateChange = (noteId: string, e: React.ChangeEvent<HTMLInputElement>) => {
+    onUpdateExamDate(noteId, e.target.value);
+  };
 
   return (
-    <div className="h-full overflow-x-auto pb-4">
-      <div className="flex gap-4 min-w-[900px] h-full">
-        {columns.map(col => (
-          <div key={col.id} className="flex-1 min-w-[220px] flex flex-col gap-3">
-            <div className="flex items-center justify-between px-1 py-2">
-              <span className="text-xs font-medium text-zinc-400 uppercase tracking-widest">{col.label}</span>
-              <span className="text-[10px] text-zinc-500 bg-zinc-100 dark:bg-white/10 px-2 py-0.5 rounded-full font-medium">
-                {notes.filter(n => n.status === col.id).length}
-              </span>
-            </div>
-            
-            <div className="flex-1 space-y-3 p-1">
-              {notes.filter(n => n.status === col.id).length === 0 ? (
-                 <div className="h-24 border border-dashed border-zinc-200 dark:border-white/5 rounded-lg flex items-center justify-center">
-                    <span className="text-[10px] text-zinc-400 uppercase tracking-widest">Empty</span>
-                 </div>
-              ) : (
-                notes.filter(n => n.status === col.id).map(note => (
-                    <div key={note.id} className="glass-panel p-4 rounded-lg hover:border-indigo-400/30 dark:hover:border-indigo-500/30 transition-all cursor-pointer group shadow-sm hover:shadow-md">
-                    <div className="flex justify-between items-start mb-2">
-                        <span className="text-[9px] font-bold text-zinc-400 uppercase tracking-wider">{note.subject}</span>
-                        {note.status !== 'new' && <Clock size={10} className="text-amber-500" />}
-                    </div>
-                    <h4 className="text-zinc-800 dark:text-zinc-100 font-medium text-sm mb-1">{note.title}</h4>
-                    <p className="text-zinc-500 dark:text-zinc-500 text-xs line-clamp-2">{note.summary}</p>
-                    </div>
-                ))
-              )}
-            </div>
-          </div>
-        ))}
-      </div>
+    <div className="space-y-8 animate-in fade-in duration-500">
+       <div className="glass-panel p-6 rounded-2xl border-l-4 border-l-indigo-500">
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-white mb-2">Study Plan</h2>
+          <p className="text-sm text-zinc-500 font-light">
+             The spacing effect algorithm schedules your reviews. Enter an exam date for priority scheduling.
+          </p>
+       </div>
+
+       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {upcomingReviews.map(note => {
+             const reviewDate = new Date(note.nextReview!);
+             const isDue = reviewDate <= today;
+             const daysUntil = Math.ceil((reviewDate.getTime() - today.getTime()) / (1000 * 3600 * 24));
+             
+             return (
+               <div key={note.id} className="glass-panel p-5 rounded-xl flex flex-col relative group">
+                  <div className={`absolute top-0 right-0 px-3 py-1 rounded-bl-xl text-[10px] font-bold uppercase tracking-wider ${isDue ? 'bg-indigo-500 text-white' : 'bg-zinc-100 dark:bg-white/10 text-zinc-500'}`}>
+                     {isDue ? 'Due Now' : `In ${daysUntil} Days`}
+                  </div>
+                  
+                  <div className="mb-4">
+                     <span className="text-[10px] text-zinc-400 uppercase tracking-wide">{note.subject}</span>
+                     <h3 className="text-base font-medium text-zinc-900 dark:text-white mt-1 line-clamp-1">{note.title}</h3>
+                  </div>
+
+                  <div className="mt-auto space-y-3">
+                     <div className="flex items-center gap-2 text-xs text-zinc-500">
+                        <CalendarIcon size={14} />
+                        <span>Exam: </span>
+                        <input 
+                          type="date" 
+                          className="bg-transparent border-b border-zinc-200 dark:border-white/20 focus:outline-none focus:border-indigo-500 text-zinc-800 dark:text-zinc-200 w-28"
+                          defaultValue={note.examDate ? new Date(note.examDate).toISOString().split('T')[0] : ''}
+                          onChange={(e) => handleDateChange(note.id, e)}
+                        />
+                     </div>
+                     
+                     <div className="w-full bg-zinc-100 dark:bg-white/5 rounded-full h-1.5 overflow-hidden">
+                        <div 
+                           className="h-full bg-indigo-500 transition-all duration-500" 
+                           style={{ width: `${note.status === 'mastered' ? 100 : note.status === 'review_7' ? 75 : note.status === 'review_3' ? 50 : 25}%` }}
+                        />
+                     </div>
+                  </div>
+               </div>
+             );
+          })}
+          
+          {upcomingReviews.length === 0 && (
+             <div className="col-span-full py-12 text-center text-zinc-400 italic font-light">
+                No upcoming reviews scheduled. Upload notes to start.
+             </div>
+          )}
+       </div>
     </div>
   );
 };
@@ -246,50 +525,190 @@ const RevisionBoard = ({ notes }: { notes: Note[] }) => {
 // --- Main App ---
 
 function App() {
+  const [user, setUser] = useState<UserProfile | null>(null);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isUploadOpen, setIsUploadOpen] = useState(false);
+  const [selectedNote, setSelectedNote] = useState<Note | null>(null);
+  const [isDetailOpen, setIsDetailOpen] = useState(false);
+  const [isUpdating, setIsUpdating] = useState(false);
   
   // Data State
   const [notes, setNotes] = useState<Note[]>([]);
   const [stats, setStats] = useState<UserStats>({ streak: 0, xp: 0, level: 1, mandalaProgress: 0 });
-  
+  const [isLoading, setIsLoading] = useState(true);
   const [theme, setTheme] = useState<'light' | 'dark'>('dark');
 
-  // Initialization: Load data from storage
-  useEffect(() => {
-    const loadedNotes = storageService.getNotes();
-    const loadedStats = storageService.getStats();
-    setNotes(loadedNotes);
-    setStats(loadedStats);
+  const loadData = async () => {
+      try {
+          const [loadedNotes, loadedStats] = await Promise.all([
+              storageService.getNotes(),
+              storageService.getStats()
+          ]);
+          setNotes(loadedNotes);
+          setStats(loadedStats);
+      } catch (e) {
+          console.error("Failed to load data", e);
+      }
+      setIsLoading(false);
+  };
 
-    document.documentElement.classList.toggle('dark', theme === 'dark');
+  // Initialization: Listen to Supabase Auth Changes
+  useEffect(() => {
+    // 1. Initial Session Check
+    if (supabase) {
+        supabase.auth.getUser().then(({ data: { user } }) => {
+            if (user) {
+                const meta = user.user_metadata || {};
+                setUser({
+                    id: user.id,
+                    name: meta.full_name || 'Student',
+                    email: user.email || '',
+                    grade: meta.grade || '10',
+                    joinedAt: user.created_at
+                });
+                loadData();
+            } else {
+                setIsLoading(false);
+            }
+        });
+
+        // 2. Subscribe to auth changes (Sign In / Sign Out)
+        const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+            if (event === 'SIGNED_IN' && session?.user) {
+                const user = session.user;
+                const meta = user.user_metadata || {};
+                setUser({
+                    id: user.id,
+                    name: meta.full_name || 'Student',
+                    email: user.email || '',
+                    grade: meta.grade || '10',
+                    joinedAt: user.created_at
+                });
+                loadData();
+            } else if (event === 'SIGNED_OUT') {
+                setUser(null);
+                setNotes([]);
+                setStats({ streak: 0, xp: 0, level: 1, mandalaProgress: 0 });
+                setActiveTab('dashboard');
+            }
+        });
+
+        return () => subscription.unsubscribe();
+    } else {
+        setIsLoading(false);
+    }
+  }, []);
+
+  // Theme Management
+  useEffect(() => {
+      document.documentElement.classList.toggle('dark', theme === 'dark');
   }, [theme]);
 
-  const addNote = (note: Note) => {
+  // Handle Login State Change (Only used by LandingPage to force refresh if listener doesn't catch it immediately)
+  const handleLogin = (newUser: UserProfile) => {
+      setUser(newUser);
+      loadData();
+  };
+
+  const handleLogout = () => {
+      authService.logout();
+      // State is cleared by onAuthStateChange listener
+  };
+
+  const addNote = async (note: Note) => {
     const newNotes = [note, ...notes];
     setNotes(newNotes);
-    storageService.saveNotes(newNotes);
-
-    // Gamification Logic: XP gain
+    
     const newStats = { 
         ...stats, 
         xp: stats.xp + 50, 
-        mandalaProgress: Math.min(stats.mandalaProgress + 10, 100),
-        // Simple streak logic: increment if this is the first action today (mocked)
-        streak: stats.streak === 0 ? 1 : stats.streak 
+        mandalaProgress: Math.min(stats.mandalaProgress + 5, 100)
     };
     setStats(newStats);
-    storageService.saveStats(newStats);
+
+    // Save only the new note to DB to avoid bulk errors
+    try {
+        await Promise.all([
+          storageService.upsertNote(note),
+          storageService.saveStats(newStats)
+        ]);
+    } catch (e) {
+        console.error("Failed to persist new note", e);
+        // Optional: revert state or show alert
+    }
   };
 
-  // Determine priority note for Dashboard Hero
-  const priorityNote = notes.find(n => n.status !== 'mastered' && n.status !== 'new') || notes[0];
+  const handleMarkRevised = async (note: Note) => {
+    setIsUpdating(true);
+    try {
+        const nextStatus = getNextStatus(note.status);
+        const nextDate = getNextReviewDate(nextStatus);
+        
+        const updatedNote = { ...note, status: nextStatus, nextReview: nextDate };
+        const updatedNotes = notes.map(n => n.id === note.id ? updatedNote : n);
+        
+        setNotes(updatedNotes);
+        setSelectedNote(updatedNote); 
 
+        const newStats = {
+        ...stats,
+        xp: stats.xp + 100,
+        streak: stats.streak + 1,
+        mandalaProgress: Math.min(stats.mandalaProgress + 15, 100)
+        };
+        setStats(newStats);
+
+        await Promise.all([
+            storageService.upsertNote(updatedNote),
+            storageService.saveStats(newStats)
+        ]);
+    } catch (e) {
+        console.error("Failed to mark revised", e);
+        alert("Could not save progress. Please try again.");
+    } finally {
+        setIsUpdating(false);
+    }
+  };
+
+  const updateExamDate = async (noteId: string, date: string) => {
+    const noteToUpdate = notes.find(n => n.id === noteId);
+    if (!noteToUpdate) return;
+    
+    const updatedNote = { ...noteToUpdate, examDate: date };
+    const updatedNotes = notes.map(n => n.id === noteId ? updatedNote : n);
+    setNotes(updatedNotes);
+    
+    try {
+        await storageService.upsertNote(updatedNote);
+    } catch (e) {
+        console.error("Failed to update exam date", e);
+    }
+  };
+
+  const openNoteDetail = (note: Note) => {
+    setSelectedNote(note);
+    setIsDetailOpen(true);
+  };
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-zinc-50 dark:bg-[#050505] flex items-center justify-center">
+        <div className="w-8 h-8 rounded-full border-2 border-indigo-500 border-t-transparent animate-spin"></div>
+      </div>
+    );
+  }
+
+  // AUTH CHECK: Render Landing Page if no user
+  if (!user) {
+      return <LandingPage onLogin={handleLogin} />;
+  }
+
+  // MAIN DASHBOARD
   return (
     <div className="min-h-screen text-zinc-900 dark:text-zinc-200 font-sans">
       <div className="bg-grid-black/[0.02] dark:bg-grid-white/[0.02] fixed inset-0 pointer-events-none z-0" />
       
-      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} />
+      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} onLogout={handleLogout} />
       
       <main className="pl-16 md:pl-64 flex flex-col min-h-screen relative z-10 transition-all duration-300">
         
@@ -297,7 +716,7 @@ function App() {
         <header className="h-20 flex items-center justify-between px-6 md:px-10 sticky top-0 z-20 backdrop-blur-xl bg-white/70 dark:bg-[#050505]/70 border-b border-zinc-200/50 dark:border-white/5">
           <div>
             <h1 className="text-lg font-medium text-zinc-900 dark:text-white capitalize tracking-tight">{activeTab}</h1>
-            <p className="text-xs text-zinc-400 dark:text-zinc-500 font-normal mt-0.5">Welcome back, Student</p>
+            <p className="text-xs text-zinc-400 dark:text-zinc-500 font-normal mt-0.5">Welcome back, {user.name.split(' ')[0]}</p>
           </div>
 
           <div className="flex items-center gap-4">
@@ -332,27 +751,25 @@ function App() {
                    <div className="lg:col-span-2 glass-panel rounded-2xl p-8 relative overflow-hidden group">
                       <div className="absolute inset-0 bg-gradient-to-br from-indigo-50/50 via-transparent to-transparent dark:from-indigo-950/30 pointer-events-none"></div>
                       <div className="relative z-10 flex flex-col h-full justify-between">
-                        {priorityNote ? (
+                        {notes.length > 0 ? (
                             <>
                                 <div>
                                 <span className="inline-block px-2 py-1 bg-indigo-100 dark:bg-indigo-500/20 text-indigo-600 dark:text-indigo-300 text-[10px] font-bold uppercase tracking-wider rounded mb-3">Priority</span>
-                                <h2 className="text-3xl font-light text-zinc-900 dark:text-white mb-2 tracking-tight">Focus on <span className="font-medium text-indigo-600 dark:text-indigo-400">{priorityNote.subject}</span></h2>
+                                <h2 className="text-3xl font-light text-zinc-900 dark:text-white mb-2 tracking-tight">Focus on <span className="font-medium text-indigo-600 dark:text-indigo-400">{notes[0].subject}</span></h2>
                                 <p className="text-zinc-600 dark:text-zinc-400 font-light max-w-md leading-relaxed text-sm line-clamp-2">
-                                    "{priorityNote.title}" is up next for review. 
-                                    {priorityNote.status === 'new' ? ' Start your first study session.' : ' Keep your memory fresh.'}
+                                    "{notes[0].title}" is up next for review. Keep your memory fresh.
                                 </p>
                                 </div>
-                                <button onClick={() => setActiveTab('revision')} className="w-fit flex items-center gap-2 text-sm font-medium text-zinc-900 dark:text-white hover:gap-3 transition-all mt-6 group/btn">
+                                <button onClick={() => openNoteDetail(notes[0])} className="w-fit flex items-center gap-2 text-sm font-medium text-zinc-900 dark:text-white hover:gap-3 transition-all mt-6 group/btn">
                                     Start Session <ArrowRight size={16} className="text-indigo-500" />
                                 </button>
                             </>
                         ) : (
                             <>
                                 <div>
-                                <span className="inline-block px-2 py-1 bg-emerald-100 dark:bg-emerald-500/20 text-emerald-600 dark:text-emerald-300 text-[10px] font-bold uppercase tracking-wider rounded mb-3">Welcome</span>
                                 <h2 className="text-3xl font-light text-zinc-900 dark:text-white mb-2 tracking-tight">Welcome to <span className="font-medium text-indigo-600 dark:text-indigo-400">Neoclass</span></h2>
                                 <p className="text-zinc-600 dark:text-zinc-400 font-light max-w-md leading-relaxed text-sm">
-                                    Your AI-powered study companion. Upload your first note to begin your journey to mastery.
+                                    Your AI-powered study companion. Upload your first note to begin.
                                 </p>
                                 </div>
                                 <button onClick={() => setIsUploadOpen(true)} className="w-fit flex items-center gap-2 text-sm font-medium text-zinc-900 dark:text-white hover:gap-3 transition-all mt-6 group/btn">
@@ -401,14 +818,14 @@ function App() {
                     <button onClick={() => setIsUploadOpen(true)} className="text-xs text-indigo-500 hover:underline mt-2">Upload your first note</button>
                   </div>
                 ) : (
-                  notes.map(note => <NoteCard key={note.id} note={note} />)
+                  notes.map(note => <NoteCard key={note.id} note={note} onClick={() => openNoteDetail(note)} />)
                 )}
              </div>
           )}
 
           {activeTab === 'revision' && (
             <div className="animate-in fade-in duration-500 h-full">
-              <RevisionBoard notes={notes} />
+               <RevisionBoard notes={notes} onUpdateExamDate={updateExamDate} />
             </div>
           )}
 
@@ -446,6 +863,14 @@ function App() {
         isOpen={isUploadOpen} 
         onClose={() => setIsUploadOpen(false)}
         onNoteProcessed={addNote}
+      />
+      
+      <NoteDetailModal 
+        note={selectedNote}
+        isOpen={isDetailOpen}
+        onClose={() => setIsDetailOpen(false)}
+        onMarkRevised={handleMarkRevised}
+        isUpdating={isUpdating}
       />
     </div>
   );
